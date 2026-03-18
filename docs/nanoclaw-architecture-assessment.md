@@ -10,7 +10,7 @@
 **实现文件**：
 - `src/channels/registry.ts` - Channel 注册工厂模式
 - `src/channels/index.ts` - Channel 自注册
-- `src/types.ts` - Channel 接口、NewMessage 定义（第82-108行）
+- `src/types.ts` - Channel 接口、NewMessage 定义
 - `src/router.ts` - 格式化消息（第13-25行）
 
 **核心函数**：
@@ -21,8 +21,8 @@
 **匹配度**：**部分匹配**
 - ✅ 有统一的消息输入规范化（formatMessages）
 - ✅ 通过 Channel 接口实现多渠道输入解析
-- ❌ 缺少明确的 InboundEvent 数据结构体定义（目前是 NewMessage）
-- ❌ 验证逻辑散落在 index.ts 的 allowlist 检查（第552-566行）中，不集中
+- ❌ 缺少“已校验输入契约”的显式 InboundEvent 定义（目前 `NewMessage` 同时承担传输、存储与已验证事件语义，验证边界不清晰；见“优先级 2”）
+- ❌ 验证逻辑散落在 `index.ts` 的消息接收与处理路径中（如 sender allowlist 检查），不集中
 
 ---
 
@@ -118,6 +118,8 @@ parse OUTPUT_START/END markers → streaming output → container.wait()
 #### 5. 门下省（Outbound Reply Validation/Guard Approval/Filter/Reject）
 **目标**：出站回复验证/守卫批准/过滤/拒绝，不生成内容
 
+说明：这里应区分两层验证——技术层（路由可达性）与策略层（目标许可、内容合规）。
+
 **实现文件**：
 - `src/router.ts` - 出站路由与格式化
   - `stripInternalTags()` - 移除内部标记（第27-29行）
@@ -130,14 +132,14 @@ parse OUTPUT_START/END markers → streaming output → container.wait()
 
 **验证逻辑**：
 - `formatOutbound()` 仅移除内部标记，不修改内容
-- `routeOutbound()` 验证 channel 所有权后发送
-- 发件人检查在 inbound，不在出站（设计问题）
+- `routeOutbound()` 仅验证“技术路由可达性”（channel 所有权/连接状态）后发送
+- 发件人检查位于 inbound（合理）；但 outbound 缺少独立策略守卫（设计缺口）
 
 **匹配度**：**部分匹配**
 - ✅ 有出站格式化与路由逻辑
 - ✅ 移除内部推理标记（_internal_）
 - ❌ 缺少出站内容守卫/批准机制（仅有格式化，无拒绝逻辑）
-- ❌ 发件人白名单应用于 inbound，不在 outbound（设计不对称）
+- ❌ 出站路径缺少策略层守卫（目标 jid 许可、内容策略），当前仅有技术层路由校验
 
 ---
 
@@ -213,7 +215,7 @@ const text = formatOutbound(rawText);
 if (text) await channel.sendMessage(jid, text);
 ```
 
-**风险**：Agent 可通过 IPC 绕过权限检查直接发送消息
+**风险**：除 IPC 命令路径外，主流程的直接出站发送缺少同等策略守卫，导致控制点不一致
 
 **证据**：ipc.ts 第76-83行有 isMain 权限检查，但出站路径无此机制
 
@@ -320,11 +322,12 @@ src/router.ts 的 formatOutbound() 仅移除内部标记。
 ### 建议改进（文档）
 建立显式的 "outbound guard" 步骤：
 1. 格式化（现有）
-2. 权限检查（缺失）- 验证发件人对目标 jid 的权限
+2. 守卫检查（缺失）- 重点验证“目标 jid 是否在允许范围”与“内容是否满足策略”
 3. 内容校验（建议）- 可选的内容过滤规则
 4. 发送（现有）
 
-关键：权限检查应在 router.ts 而非 index.ts 调用处。
+关键：权限检查不应散落在调用点；建议新增独立 `outbound-guard`（或在中书省统一调用），
+再由 `router.ts` 专注执行技术路由。
 ```
 
 ### 优先级 2：规范化 InboundEvent（通政司）
@@ -332,23 +335,21 @@ src/router.ts 的 formatOutbound() 仅移除内部标记。
 **建议**：在 types.ts 中显式定义
 
 ```typescript
-// types.ts
+// types.ts（建议）
+// 统一的规范化输入（保持与现有 NewMessage 一致的 snake_case）
 export interface InboundEvent {
-  // 规范化输入，无论 channel 来源
-  chatJid: string;
-  sender: string;
-  senderName: string;
-  content: string;
-  timestamp: string;
-  isFromMe: boolean;
-  isBotMessage?: boolean;
-}
-
-// 与 NewMessage 关系明确
-export interface NewMessage extends InboundEvent {
   id: string;
   chat_jid: string;
+  sender: string;
+  sender_name: string;
+  content: string;
+  timestamp: string;
+  is_from_me: boolean;
+  is_bot_message?: boolean;
 }
+
+// 与当前 NewMessage 的关系：InboundEvent 表达“已完成校验的输入契约”，
+// NewMessage 保持持久化/传输模型，二者字段命名保持一致可降低迁移成本。
 ```
 
 ### 优先级 3：权限模型文档化（Role/Assets）
@@ -391,7 +392,7 @@ export interface NewMessage extends InboundEvent {
 ### 保证
 - .claude/ 目录是 single source of truth
 - DB 中的 session_id 用于恢复指针
-- 无显式事务，但顺序保证（先 DB 后目录）
+- 无显式事务，当前流程以“先目录恢复、后写 DB 指针”为主
 ```
 
 ### 优先级 5：IPC 权限防守前置（六部/中书省）
@@ -402,7 +403,7 @@ export interface NewMessage extends InboundEvent {
 ## 容器信任边界
 
 ### IPC 安全模型
-- ❌ 信任 container 不写恶意 IPC 文件
+- ❌ 不信任 container（假设其可能写入恶意 IPC 文件）
 - ✅ 信任 host IPC 处理器验证每个请求
 - ✅ 信任外部配置文件（mount-allowlist.json）无法从容器访问
 
@@ -424,4 +425,3 @@ ipc.ts processTaskIpc() 中的所有权限检查是 host 侧防守，
 | 扩展性 | ⭐⭐⭐⭐ | Skill 系统与 channel 工厂模式良好 |
 
 **核心建议**：完善出站守卫、规范化 InboundEvent、文档化权限矩阵。改动范围最小，价值最大。
-
